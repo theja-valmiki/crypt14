@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crypt14 Decryptor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1e21; --muted:#667085; --accent:#128c7e; --border:#d9dde3; --err:#b42318; --ok:#067647; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --card:#1a1f26; --text:#e8eaed; --muted:#98a2b3; --accent:#25d366; --border:#2d3540; --err:#f97066; --ok:#47cd89; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { margin:0 0 4px; font-size:1.5rem; }
+  p.sub { margin:0 0 20px; color:var(--muted); }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .row { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
+  label { display:block; font-weight:600; margin-bottom:6px; }
+  input[type=file], input[type=text], select { width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; }
+  small { color:var(--muted); display:block; margin-top:4px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:9px 16px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  #status { margin-top:12px; white-space:pre-wrap; }
+  .err { color:var(--err); } .ok { color:var(--ok); }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+  .toolbar > * { width:auto; }
+  .toolbar input[type=text] { flex:1; min-width:180px; }
+  .tablewrap { overflow:auto; max-height:520px; border:1px solid var(--border); border-radius:6px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); vertical-align:top; max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  th { position:sticky; top:0; background:var(--card); }
+  td:hover { white-space:normal; word-break:break-word; }
+  .chat { display:flex; flex-direction:column; gap:6px; max-height:520px; overflow:auto; padding:8px; }
+  .msg { max-width:75%; padding:6px 10px; border-radius:10px; background:var(--bg); border:1px solid var(--border); white-space:pre-wrap; word-break:break-word; }
+  .msg.me { align-self:flex-end; background:color-mix(in srgb, var(--accent) 18%, var(--card)); }
+  .msg .meta { color:var(--muted); font-size:11px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Crypt14 Decryptor</h1>
+  <p class="sub">Decrypts a WhatsApp <code>msgstore.db.crypt14</code> backup entirely in your browser. Nothing is uploaded.</p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="dbfile">1. Backup file (.crypt14)</label>
+        <input id="dbfile" type="file" accept=".crypt14,*/*">
+      </div>
+      <div>
+        <label for="keyfile">2. Key file</label>
+        <input id="keyfile" type="file">
+        <small>The 158-byte <code>key</code> file from <code>/data/data/com.whatsapp/files/key</code> (needs root).</small>
+      </div>
+      <div>
+        <label for="keyhex">or 32-byte key as 64 hex chars</label>
+        <input id="keyhex" type="text" placeholder="64 hex characters" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <p><button id="go">Decrypt</button></p>
+    <div id="status"></div>
+  </div>
+
+  <div id="result" class="hidden">
+    <div class="card">
+      <div class="toolbar">
+        <select id="view"></select>
+        <input id="search" type="text" placeholder="Filter rows / messages…">
+        <button id="download" class="ghost">Download msgstore.db</button>
+      </div>
+      <div id="info" class="muted"></div>
+      <div id="out"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ---------- decryption core ---------- */
+// BEGIN-CORE
+function hexToBytes(h) {
+  h = h.replace(/\s+/g, '');
+  if (!/^[0-9a-fA-F]{64}$/.test(h)) throw new Error('Hex key must be exactly 64 hex characters.');
+  return Uint8Array.from(h.match(/../g), b => parseInt(b, 16));
+}
+
+function keyFromBytes(b) {
+  if (b.length === 158) return b.slice(126, 158); // WhatsApp "key" file: AES key is the last 32 bytes
+  if (b.length === 32) return b;
+  throw new Error('Key must be a 158-byte WhatsApp key file or 32 raw bytes (got ' + b.length + ' bytes).');
+}
+
+async function inflateZlib(bytes) {
+  const ds = new DecompressionStream('deflate');
+  const stream = new Blob([bytes]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// Header layouts seen in crypt14 files: [IV offset, ciphertext offset]
+const LAYOUTS = [[67, 191], [66, 190], [67, 190], [66, 191]];
+// Footer layouts after ciphertext: GCM tag (16) followed by optional MD5 (16)
+const FOOTERS = [32, 16];
+
+async function decryptCrypt14(file, keyBytes) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt']);
+  for (const [ivOff, dataOff] of LAYOUTS) {
+    const iv = file.subarray(ivOff, ivOff + 16);
+    for (const foot of FOOTERS) {
+      const body = file.subarray(dataOff, file.length - foot + 16); // ciphertext + 16-byte tag
+      if (body.length < 32) continue;
+      try {
+        const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, body));
+        return await inflateZlib(plain);
+      } catch (e) { /* try next layout */ }
+    }
+  }
+  throw new Error('Decryption failed: wrong key, or an unsupported header layout (is this really crypt14? crypt15 needs the 64-digit E2E key).');
+}
+// END-CORE
+
+/* ---------- UI ---------- */
+const $ = id => document.getElementById(id);
+const status = (msg, cls) => { $('status').textContent = msg; $('status').className = cls || ''; };
+let SQL, db, dbBytes;
+
+const readFile = f => f.arrayBuffer().then(b => new Uint8Array(b));
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+$('go').onclick = async () => {
+  try {
+    const dbf = $('dbfile').files[0];
+    if (!dbf) throw new Error('Choose the .crypt14 file.');
+    let keyBytes;
+    if ($('keyhex').value.trim()) keyBytes = hexToBytes($('keyhex').value);
+    else if ($('keyfile').files[0]) keyBytes = keyFromBytes(await readFile($('keyfile').files[0]));
+    else throw new Error('Provide the key file or a 64-hex key.');
+    $('go').disabled = true;
+    status('Decrypting…');
+    dbBytes = await decryptCrypt14(await readFile(dbf), keyBytes);
+    if (new TextDecoder().decode(dbBytes.subarray(0, 15)) !== 'SQLite format 3')
+      throw new Error('Decrypted, but the result is not a SQLite database (wrong key?).');
+    SQL = SQL || await initSqlJs({ locateFile: f => 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/' + f });
+    db = new SQL.Database(dbBytes);
+    status('Decrypted ' + (dbBytes.length / 1048576).toFixed(2) + ' MB successfully.', 'ok');
+    buildViews();
+  } catch (e) {
+    status(e.message, 'err');
+  } finally {
+    $('go').disabled = false;
+  }
+};
+
+$('download').onclick = () => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([dbBytes], { type: 'application/x-sqlite3' }));
+  a.download = 'msgstore.db';
+  a.click();
+};
+
+const q = (sql, p) => {
+  const r = db.exec(sql, p);
+  return r.length ? r[0] : { columns: [], values: [] };
+};
+const hasTable = n => q("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", [n]).values.length > 0;
+
+function buildViews() {
+  const sel = $('view');
+  sel.innerHTML = '';
+  const add = (v, t) => sel.add(new Option(t, v));
+  if (hasTable('message') || hasTable('messages')) add('@messages', 'Messages (readable)');
+  q("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").values
+    .forEach(([n]) => add('t:' + n, 'Table: ' + n));
+  $('result').classList.remove('hidden');
+  render();
+}
+$('view').onchange = render;
+$('search').oninput = render;
+
+function renderTable(res, filter) {
+  const f = filter.toLowerCase();
+  const rows = f ? res.values.filter(r => r.some(c => String(c ?? '').toLowerCase().includes(f))) : res.values;
+  const shown = rows.slice(0, 500);
+  $('info').textContent = rows.length + ' row(s)' + (rows.length > 500 ? ' (showing first 500)' : '');
+  $('out').innerHTML = '<div class="tablewrap"><table><thead><tr>' +
+    res.columns.map(c => '<th>' + esc(c) + '</th>').join('') + '</tr></thead><tbody>' +
+    shown.map(r => '<tr>' + r.map(c => '<td>' + (c instanceof Uint8Array ? '[blob ' + c.length + ' B]' : esc(c)) + '</td>').join('') + '</tr>').join('') +
+    '</tbody></table></div>';
+}
+
+function fmtTime(ms) {
+  const d = new Date(Number(ms));
+  return isNaN(d) || !ms ? '' : d.toLocaleString();
+}
+
+function renderMessages(filter) {
+  let res;
+  if (hasTable('message')) { // newer schema
+    res = q(`SELECT m.timestamp, m.from_me, COALESCE(j.raw_string, '') AS chat, COALESCE(m.text_data, '') AS text
+             FROM message m LEFT JOIN chat c ON c._id = m.chat_row_id LEFT JOIN jid j ON j._id = c.jid_row_id
+             WHERE m.text_data IS NOT NULL AND m.text_data != '' ORDER BY m.timestamp`);
+  } else { // older schema
+    res = q(`SELECT timestamp, key_from_me AS from_me, key_remote_jid AS chat, COALESCE(data,'') AS text
+             FROM messages WHERE data IS NOT NULL AND data != '' ORDER BY timestamp`);
+  }
+  const chats = [...new Set(res.values.map(r => r[2]))].sort();
+  const prev = $('info').dataset.chat || '';
+  const f = filter.toLowerCase();
+  const list = res.values.filter(r => (!prev || r[2] === prev) && (!f || String(r[3]).toLowerCase().includes(f) || String(r[2]).toLowerCase().includes(f)));
+  const opts = '<select id="chatsel"><option value="">All chats (' + chats.length + ')</option>' +
+    chats.map(c => '<option' + (c === prev ? ' selected' : '') + ' value="' + esc(c) + '">' + esc(c) + '</option>').join('') + '</select>';
+  $('info').innerHTML = list.length + ' message(s) ' + opts + (list.length > 1000 ? ' (showing first 1000)' : '');
+  $('chatsel').onchange = e => { $('info').dataset.chat = e.target.value; render(); };
+  $('out').innerHTML = '<div class="chat">' + list.slice(0, 1000).map(r =>
+    '<div class="msg' + (r[1] ? ' me' : '') + '"><div class="meta">' + esc(r[1] ? 'Me' : r[2]) + ' · ' + esc(fmtTime(r[0])) + '</div>' + esc(r[3]) + '</div>').join('') + '</div>';
+}
+
+function render() {
+  const v = $('view').value, filter = $('search').value;
+  if (v === '@messages') {
+    try { renderMessages(filter); } catch (e) { $('out').textContent = 'Could not read messages: ' + e.message; }
+  } else {
+    $('info').dataset.chat = '';
+    renderTable(q('SELECT * FROM "' + v.slice(2).replace(/"/g, '""') + '" LIMIT 20000'), filter);
+  }
+}
+</script>
+</body>
+</html>
