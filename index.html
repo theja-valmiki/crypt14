@@ -49,7 +49,7 @@
     <div class="row">
       <div>
         <label for="dbfile">1. Backup file (.crypt14)</label>
-        <input id="dbfile" type="file" accept=".crypt14,*/*">
+        <input id="dbfile" type="file" accept=".crypt14">
       </div>
       <div>
         <label for="keyfile">2. Key file</label>
@@ -133,6 +133,7 @@ $('go').onclick = async () => {
   try {
     const dbf = $('dbfile').files[0];
     if (!dbf) throw new Error('Choose the .crypt14 file.');
+    if (!/\.crypt14$/i.test(dbf.name)) throw new Error('Please choose a .crypt14 file (got "' + dbf.name + '").');
     let keyBytes;
     if ($('keyhex').value.trim()) keyBytes = hexToBytes($('keyhex').value);
     else if ($('keyfile').files[0]) keyBytes = keyFromBytes(await readFile($('keyfile').files[0]));
