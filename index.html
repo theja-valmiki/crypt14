@@ -42,14 +42,14 @@
 </head>
 <body>
 <main>
-  <h1>Crypt14 Decryptor</h1>
-  <p class="sub">Decrypts a WhatsApp <code>msgstore.db.crypt14</code> backup entirely in your browser. Nothing is uploaded.</p>
+  <h1>Crypt14 / Crypt15 Decryptor</h1>
+  <p class="sub">Decrypts a WhatsApp <code>msgstore.db.crypt14</code> or <code>.crypt15</code> backup entirely in your browser. Nothing is uploaded.</p>
 
   <div class="card">
     <div class="row">
       <div>
-        <label for="dbfile">1. Backup file (.crypt14)</label>
-        <input id="dbfile" type="file" accept=".crypt14">
+        <label for="dbfile">1. Backup file (.crypt14 or .crypt15)</label>
+        <input id="dbfile" type="file" accept=".crypt14,.crypt15">
       </div>
       <div>
         <label for="keyfile">2. Key file</label>
@@ -57,8 +57,8 @@
         <small>The 158-byte <code>key</code> file from <code>/data/data/com.whatsapp/files/key</code> (needs root).</small>
       </div>
       <div>
-        <label for="keyhex">or 32-byte key as 64 hex chars</label>
-        <input id="keyhex" type="text" placeholder="64 hex characters" autocomplete="off" spellcheck="false">
+        <label for="keyhex">or 64-digit key (hex)</label>
+        <input id="keyhex" type="text" placeholder="64 hex characters (required for .crypt15)" autocomplete="off" spellcheck="false">
       </div>
     </div>
     <p><button id="go">Decrypt</button></p>
@@ -119,6 +119,67 @@ async function decryptCrypt14(file, keyBytes) {
   }
   throw new Error('Decryption failed: wrong key, or an unsupported header layout (is this really crypt14? crypt15 needs the 64-digit E2E key).');
 }
+
+/* crypt15: key comes from the 64-digit E2E key via HKDF-SHA256 (salt = 32 zero bytes, info = "backup encryption") */
+async function hmac(keyBytes, msg) {
+  const k = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, msg));
+}
+
+async function deriveCrypt15Key(root) {
+  const prk = await hmac(new Uint8Array(32), root);
+  const info = new TextEncoder().encode('backup encryption');
+  const msg = new Uint8Array(info.length + 1);
+  msg.set(info);
+  msg[info.length] = 1;
+  return hmac(prk, msg);
+}
+
+// Collect every 16-byte field in the protobuf header; one of them is the AES-GCM IV.
+function pbIvCandidates(buf, start, end, out = [], depth = 0) {
+  let p = start;
+  const varint = () => {
+    let r = 0, s = 0, b;
+    do { if (p >= end) throw 0; b = buf[p++]; r += (b & 0x7f) * 2 ** s; s += 7; } while (b & 0x80);
+    return r;
+  };
+  try {
+    while (p < end) {
+      const wt = varint() & 7;
+      if (wt === 0) varint();
+      else if (wt === 1) p += 8;
+      else if (wt === 5) p += 4;
+      else if (wt === 2) {
+        const len = varint();
+        if (p + len > end) throw 0;
+        if (len === 16) out.push(buf.subarray(p, p + 16));
+        if (depth < 3) pbIvCandidates(buf, p, p + len, out, depth + 1);
+        p += len;
+      } else throw 0;
+    }
+  } catch (e) { /* malformed nested data: keep what we found */ }
+  return out;
+}
+
+async function decryptCrypt15(file, rootKey) {
+  const key = await crypto.subtle.importKey('raw', await deriveCrypt15Key(rootKey), 'AES-GCM', false, ['decrypt']);
+  const starts = file[1] === 1 ? [2, 1] : [1, 2];
+  for (const pb of starts) {
+    const hdrEnd = pb + file[0];
+    if (hdrEnd >= file.length) continue;
+    for (const iv of pbIvCandidates(file, pb, hdrEnd)) {
+      for (const foot of FOOTERS) {
+        const body = file.subarray(hdrEnd, file.length - foot + 16);
+        if (body.length < 32) continue;
+        try {
+          const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, body));
+          return await inflateZlib(plain);
+        } catch (e) { /* try next candidate */ }
+      }
+    }
+  }
+  throw new Error('Decryption failed: wrong 64-digit key, or an unsupported crypt15 header.');
+}
 // END-CORE
 
 /* ---------- UI ---------- */
@@ -132,15 +193,18 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 $('go').onclick = async () => {
   try {
     const dbf = $('dbfile').files[0];
-    if (!dbf) throw new Error('Choose the .crypt14 file.');
-    if (!/\.crypt14$/i.test(dbf.name)) throw new Error('Please choose a .crypt14 file (got "' + dbf.name + '").');
+    if (!dbf) throw new Error('Choose the .crypt14 or .crypt15 file.');
+    const is15 = /\.crypt15$/i.test(dbf.name);
+    if (!is15 && !/\.crypt14$/i.test(dbf.name)) throw new Error('Please choose a .crypt14 or .crypt15 file (got "' + dbf.name + '").');
     let keyBytes;
     if ($('keyhex').value.trim()) keyBytes = hexToBytes($('keyhex').value);
+    else if (is15) throw new Error('.crypt15 needs the 64-digit key (hex) from WhatsApp\'s end-to-end encrypted backup.');
     else if ($('keyfile').files[0]) keyBytes = keyFromBytes(await readFile($('keyfile').files[0]));
-    else throw new Error('Provide the key file or a 64-hex key.');
+    else throw new Error('Provide the key file or the 64-digit key.');
     $('go').disabled = true;
     status('Decrypting…');
-    dbBytes = await decryptCrypt14(await readFile(dbf), keyBytes);
+    const raw = await readFile(dbf);
+    dbBytes = is15 ? await decryptCrypt15(raw, keyBytes) : await decryptCrypt14(raw, keyBytes);
     if (new TextDecoder().decode(dbBytes.subarray(0, 15)) !== 'SQLite format 3')
       throw new Error('Decrypted, but the result is not a SQLite database (wrong key?).');
     SQL = SQL || await initSqlJs({ locateFile: f => 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/' + f });
